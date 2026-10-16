@@ -38,7 +38,7 @@ from pandas import DataFrame
 
 from freqtrade.enums import RunMode
 from freqtrade.persistence import Trade
-from freqtrade.strategy import IStrategy
+from freqtrade.strategy import IStrategy, informative
 
 
 DEFAULT_SIGNALS = Path(__file__).resolve().parents[3] / "TradingAgents" / "autotrader_data" / "signals.json"
@@ -48,7 +48,8 @@ class AutoTraderSignalStrategy(IStrategy):
     INTERFACE_VERSION = 3
     can_short = False
     timeframe = "1h"
-    startup_candle_count = 200
+    # 200 daily candles for the daily trend filter, in 1h candles.
+    startup_candle_count = 4900
 
     # Risk: 6% hard stop, trail 3% once 4% in profit, take profit by ROI table.
     stoploss = -0.06
@@ -60,6 +61,20 @@ class AutoTraderSignalStrategy(IStrategy):
 
     use_exit_signal = True
     process_only_new_candles = True
+
+    # Discipline rules: pause after a cluster of stop-outs, cool down after
+    # each exit, stop on a deep drawdown, and lock pairs that keep losing.
+    @property
+    def protections(self):
+        return [
+            {"method": "CooldownPeriod", "stop_duration_candles": 6},
+            {"method": "StoplossGuard", "lookback_period_candles": 24, "trade_limit": 3,
+             "stop_duration_candles": 12, "only_per_pair": False},
+            {"method": "MaxDrawdown", "lookback_period_candles": 168, "trade_limit": 5,
+             "stop_duration_candles": 24, "max_allowed_drawdown": 0.15},
+            {"method": "LowProfitPairs", "lookback_period_candles": 336, "trade_limit": 4,
+             "stop_duration_candles": 48, "required_profit": 0.0},
+        ]
 
     signal_max_age_hours = 26
 
@@ -82,6 +97,14 @@ class AutoTraderSignalStrategy(IStrategy):
     def _live(self) -> bool:
         return self.dp.runmode in (RunMode.LIVE, RunMode.DRY_RUN)
 
+    @informative("1d")
+    def populate_indicators_1d(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # Higher-timeframe trend: only buy while the daily close is above a
+        # rising 200-day EMA (columns arrive as ema200_1d, close_1d, ...).
+        dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200)
+        dataframe["ema200_rising"] = (dataframe["ema200"] > dataframe["ema200"].shift(5)).astype(int)
+        return dataframe
+
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe["ema50"] = ta.EMA(dataframe, timeperiod=50)
         dataframe["ema200"] = ta.EMA(dataframe, timeperiod=200)
@@ -89,7 +112,8 @@ class AutoTraderSignalStrategy(IStrategy):
         return dataframe
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        trend = (dataframe["close"] > dataframe["ema50"]) & (dataframe["rsi"] < 75)
+        daily_up = (dataframe["close_1d"] > dataframe["ema200_1d"]) & (dataframe["ema200_rising_1d"] == 1)
+        trend = (dataframe["close"] > dataframe["ema50"]) & (dataframe["rsi"] < 75) & daily_up
         if self._live():
             sig = self._signal_for(metadata["pair"])
             if not sig or sig.get("action") != "BUY":
